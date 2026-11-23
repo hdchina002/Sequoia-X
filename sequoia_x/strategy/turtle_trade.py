@@ -103,9 +103,17 @@ class TurtleTradeStrategy(BaseStrategy):
                 continue
 
         # 按流通市值从大到小排序
+        # 注意：市值查询只影响排序，不是筛选条件。Azure→baostock 连接不稳时
+        # 原实现会抛 IndexError 让整个策略归零（实测 2026-11-23 触发）。
+        # 失败就保留原始顺序返回候选，绝不因为"排不了序"丢掉选股结果。
         if candidates:
-            market_caps = self._get_market_caps(candidates)
-            candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+            try:
+                market_caps = self._get_market_caps(candidates)
+                candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"流通市值查询失败，跳过排序直接返回：{type(exc).__name__}: {exc}"
+                )
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
         return candidates
