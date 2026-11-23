@@ -25,6 +25,10 @@ on:
         description: '强制重跑（忽略"今日已完成"判断，会重复推送）'
         type: boolean
         default: false
+      publish_baseline:
+        description: '只把当前数据库固化成 Release 基线，不跑选股、不推送'
+        type: boolean
+        default: false
 
 # 同一条流水线不并发：新的排队，不打断正在跑的
 concurrency:
@@ -32,7 +36,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  # write 是给 Release 基线用的：回填成果要固化到 Release，不能只押在 Actions 缓存上
+  contents: write
 
 jobs:
   daily:
@@ -69,6 +74,27 @@ jobs:
           restore-keys: |
             seq-db-
 
+      # ── 二级兜底：缓存被淘汰/首次部署时，从 Release 拉基线库 ──
+      # 为什么必须有这一层：首次全量回填要跑约 2 小时（5224 只 × 3 并发逐只查历史）。
+      # Actions 缓存 7 天不访问就会被清，跑失败也不保存 —— 一旦丢了就得重跑两小时。
+      # 把回填成果压成基线挂到 Release（永久、不受缓存淘汰影响），丢了 1 分钟拉回来。
+      - name: 缓存未命中时从 Release 恢复基线
+        run: |
+          if [ -f data/sequoia_v2.db ]; then
+            echo "✅ 缓存命中，库大小 $(du -h data/sequoia_v2.db | cut -f1)"
+            exit 0
+          fi
+          echo "缓存未命中，尝试从 Release 拉基线库……"
+          mkdir -p data
+          if gh release download db-baseline --pattern 'sequoia_v2.db.gz' --dir /tmp --clobber 2>/dev/null; then
+            gunzip -c /tmp/sequoia_v2.db.gz > data/sequoia_v2.db
+            echo "✅ 基线恢复完成，大小 $(du -h data/sequoia_v2.db | cut -f1)"
+          else
+            echo "⚠️ 无可用基线（首次部署），本次将执行全量回填，预计 2 小时"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: 数据源连通性自检
         continue-on-error: true
         run: |
@@ -90,6 +116,7 @@ jobs:
 
       - name: 执行每日选股
         id: run
+        if: inputs.publish_baseline != true
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           # 只保留最近多少个交易日（滚动窗口，体积恒定约 260MB）
@@ -120,3 +147,20 @@ jobs:
         with:
           path: data/
           key: seq-db-${{ github.run_id }}
+
+      # 把库固化成 Release 基线附件。压缩后约 60~90MB（SQLite 数值列压缩率高）。
+      # 只在数据真的更新过时覆盖，一天一次。tag 固定为 db-baseline，删旧建新，不累积。
+      - name: 更新 Release 基线
+        if: always() && (steps.run.outputs.updated == 'true' || inputs.publish_baseline == true)
+        continue-on-error: true
+        run: |
+          if [ ! -f data/sequoia_v2.db ]; then echo "无数据库，跳过"; exit 0; fi
+          gzip -c data/sequoia_v2.db > /tmp/sequoia_v2.db.gz
+          echo "压缩后 $(du -h /tmp/sequoia_v2.db.gz | cut -f1)"
+          gh release delete db-baseline --yes --cleanup-tag 2>/dev/null || true
+          gh release create db-baseline /tmp/sequoia_v2.db.gz \
+            --title "行情数据库基线（自动维护）" \
+            --notes "每日选股后自动覆盖。用途：Actions 缓存被淘汰时快速恢复，避免重跑约 2 小时的全量回填。更新时间 $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "✅ 基线上传完成"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
