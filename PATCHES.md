@@ -38,8 +38,13 @@ conn.executemany("DELETE FROM stock_daily WHERE symbol = ? AND date = ?", pairs)
 baostock 一旦卡住，10 秒超时 + 3 次重试（间隔 2/4/8 秒），单票要烧 30 秒，
 全市场跑完要十几个小时（实测 6 分钟只完成 29 只）。
 
-新版：多进程并行（默认 6~8）、每进程只 login 一次、`INSERT OR REPLACE` 幂等可续传、
-结束自动 checkpoint + VACUUM 压实成单文件。实测 5118 只约 20 分钟。
+新版：多进程并行（默认 3）、每进程只 login 一次、`INSERT OR REPLACE` 幂等可续传、
+结束自动 checkpoint + VACUUM 压实成单文件。
+
+> ⚠️ **并发数不要调高。** 实测 8 并发 + 失败后反复 logout/login，会触发 baostock 的
+> 防滥用机制，直接返回 `10001011 黑名单用户`，把整台机器的 IP 封掉（几十分钟到几小时）。
+> 现版本默认 3 并发、失败只在同一会话内退避重试、绝不再重新登录；连续 20 次黑名单自动熔断。
+> 另外 `main.py` 平时设的 `socket.setdefaulttimeout(10.0)` 也在这里被覆盖成 20 秒。
 
 ## 5. 新增 `scripts/daily_run.py` — 幂等调度器
 
@@ -74,6 +79,39 @@ GitHub Actions 的 cron 不保证准点（延迟 10~40 分钟甚至整条跳过�
 - 大比例裁剪（>2 万行）后自动 `VACUUM` 压实——DELETE 只把页面标记为空闲，
   文件本身不会缩小，不压实的话缓存里仍是裁剪前的大文件。
 - 实测：698 个交易日 → 400 日，删 274,961 行，78.9MB → 45.3MB（929 只股票样本）。
+
+## 9. 云端调度三处致命缺陷（2026-11-23 修，上线前发现）
+
+这三处只在 GitHub Actions 上才会炸，本地完全看不出来，注释一下避免以后改回去：
+
+**① `build_tasks` 用全库最新日期判定跳过 → 数据永久停更**
+
+```python
+# 错误：所有票互相看齐
+if last and global_max and last >= global_max:  # 全库都是 11-20 时，每只票都满足
+    continue
+```
+
+全库都停在同一天时，每只票都认为"我已经是最新的"，第二天起来一条数据都不会更新。
+改为用 `today` 判定（`last >= today` 才跳过）。这类 bug 首次回填时完全正常，
+只有跑第二天才暴露——不加对照测试很容易漏（实测：929 只票旧逻辑生成 0 个任务）。
+
+**② `logs/` 目录未入库 → 首次回填崩溃**
+
+`backfill_parallel.py` 会往 `logs/failures.log` 追加失败记录。`logs/` 在 `.gitignore` 里、
+不进版本控制，Actions 检出的是干净仓库 → `FileNotFoundError`，回填直接中断。
+已在 `main()` 开头 `(ROOT / "logs").mkdir(parents=True, exist_ok=True)`。
+
+**③ 同步做了两遍 → 双倍请求、8 进程重复 login**
+
+`daily_run.py` 自己调 `engine.sync_today_bulk()`，之后 `main.py` 又调一次。
+而 `sync_today_bulk` 内部起 **8 个进程、每个进程各自 login**，正是触发黑名单的配方。
+现已改为：调度器用 `backfill_parallel.py --today-only`（3 进程、每进程一次登录）同步，
+再以 `main.py --skip-sync` 跳过重复同步。
+
+**附带两处**：`--today-only` 先用沪深300指数当探针，休市/数据未发布时立刻退出
+（否则要白跑 5224 次查询才发现没数据）；workflow `timeout` 提到 240 分钟并设
+`TZ=Asia/Shanghai`（runner 默认 UTC，跨零点会算错日期）。
 
 ## 体积与额度实测（2026-11-23）
 
