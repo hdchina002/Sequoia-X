@@ -1,0 +1,101 @@
+name: Sequoia-X 每日选股
+
+# 为什么挂这么多条 cron？
+# GitHub Actions 的定时任务是"尽力而为"：高峰期常常延迟 10~40 分钟，偶尔整条跳过。
+# 所以每 20 分钟挂一条，从北京时间 17:40 覆盖到 20:00 共 8 次。
+# 由 scripts/daily_run.py 做幂等守卫：当天已成功推送就直接退出，绝不重复发群消息。
+# 只有"没跑成"的那次会真正执行 —— 也就是你要的"没跑就 20 分钟后再来一次"。
+#
+# 时区换算：GitHub 只认 UTC，北京时间 = UTC + 8 小时
+#   北京 17:40 = UTC 09:40
+
+on:
+  schedule:
+    - cron: '40 9 * * 1-5'    # 北京 17:40
+    - cron: '0 10 * * 1-5'    # 北京 18:00
+    - cron: '20 10 * * 1-5'   # 北京 18:20
+    - cron: '40 10 * * 1-5'   # 北京 18:40
+    - cron: '0 11 * * 1-5'    # 北京 19:00
+    - cron: '20 11 * * 1-5'   # 北京 19:20
+    - cron: '40 11 * * 1-5'   # 北京 19:40
+    - cron: '0 12 * * 1-5'    # 北京 20:00
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重跑（忽略"今日已完成"判断，会重复推送）'
+        type: boolean
+        default: false
+
+# 同一条流水线不并发：新的排队，不打断正在跑的
+concurrency:
+  group: sequoia-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install .
+
+      # Runner 是临时容器，跑完即销毁。SQLite 必须靠缓存跨天存活。
+      # 缓存整个 data/ 目录：既包含行情库，也包含"今日已完成"的状态文件。
+      # key 带 run_id 保证每次都能写入新缓存；restore-keys 前缀匹配即取最近一份。
+      - name: 恢复行情数据库
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: seq-db-${{ github.run_id }}
+          restore-keys: |
+            seq-db-
+
+      - name: 数据源连通性自检
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import socket, time
+          t = time.time()
+          try:
+              s = socket.create_connection(("baostock.com", 10030), timeout=15)
+              s.close()
+              print(f"baostock TCP 可达，耗时 {time.time()-t:.2f}s")
+          except Exception as e:
+              print(f"baostock TCP 探测失败：{type(e).__name__}: {e}")
+          import baostock as bs
+          lg = bs.login()
+          print("baostock login:", lg.error_code, lg.error_msg)
+          if lg.error_code == "0":
+              bs.logout()
+          PY
+
+      - name: 执行每日选股
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # 想给每个策略配独立机器人群时，在仓库 Secrets 里加对应变量并取消下面注释
+          # STRATEGY_WEBHOOK_TURTLE: ${{ secrets.STRATEGY_WEBHOOK_TURTLE }}
+          # STRATEGY_WEBHOOK_MA_VOLUME: ${{ secrets.STRATEGY_WEBHOOK_MA_VOLUME }}
+          # STRATEGY_WEBHOOK_FLAG: ${{ secrets.STRATEGY_WEBHOOK_FLAG }}
+          # STRATEGY_WEBHOOK_SHAKEOUT: ${{ secrets.STRATEGY_WEBHOOK_SHAKEOUT }}
+          # STRATEGY_WEBHOOK_LIMIT_DOWN: ${{ secrets.STRATEGY_WEBHOOK_LIMIT_DOWN }}
+          # STRATEGY_WEBHOOK_RPS: ${{ secrets.STRATEGY_WEBHOOK_RPS }}
+          # STRATEGY_WEBHOOK_PRIVATE_PLACEMENT: ${{ secrets.STRATEGY_WEBHOOK_PRIVATE_PLACEMENT }}
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            python scripts/daily_run.py --force
+          else
+            python scripts/daily_run.py
+          fi
