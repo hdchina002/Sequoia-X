@@ -37,7 +37,12 @@ permissions:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 首次回填 5224 只 × 3 并发约 60~90 分钟，再留出重试余量。
+    # 上限定太低会让首次部署在半路被砍，第二天又要从头再拉一遍。
+    timeout-minutes: 240
+    env:
+      # Runner 默认 UTC。统一成北京时间，否则 date.today() 在跨零点时会算错一天。
+      TZ: Asia/Shanghai
 
     steps:
       - name: 检出代码

@@ -36,6 +36,11 @@ def main() -> None:
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
     )
+    parser.add_argument(
+        "--skip-sync",
+        action="store_true",
+        help="跳过本次的行情同步（数据已由上层调度器拉好时使用，避免重复请求 baostock）",
+    )
     args = parser.parse_args()
 
     try:
@@ -58,9 +63,15 @@ def main() -> None:
             return
 
         # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
-        logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        if args.skip_sync:
+            # [本地补丁] 由 scripts/daily_run.py 用 3 进程的并行脚本先同步好，
+            # 这里再调一次 sync_today_bulk（8 进程 × 各自 login）纯属重复劳动，
+            # 且是触发 baostock 黑名单的主要来源。加开关避免双份请求。
+            logger.info("跳过快照同步（数据已由调度器同步）")
+        else:
+            logger.info("开始拉取最新快照...")
+            count = engine.sync_today_bulk()
+            logger.info(f"快照同步完成，写入 {count} 只股票")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [

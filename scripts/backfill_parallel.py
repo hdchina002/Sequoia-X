@@ -170,7 +170,11 @@ def build_tasks(symbols: list[str]) -> tuple[list[tuple[str, str, str]], str]:
     tasks = []
     for s in symbols:
         last = have.get(s)
-        if last and global_max and last >= global_max:
+        # 跳过条件必须用 today 判定。
+        # 早期版本写成 last >= global_max（全库最新日期），后果是所有票互相看齐：
+        # 全库都停在 11-20 时，每只票都满足 last >= global_max → 全部跳过，
+        # 数据永远不再更新。这类 bug 在首次回填时完全看不出来，只有跑第二天才暴露。
+        if last and last >= today:
             continue
         start = START_DATE
         if last:
@@ -181,17 +185,65 @@ def build_tasks(symbols: list[str]) -> tuple[list[tuple[str, str, str]], str]:
     return tasks, global_max or ""
 
 
+def today_has_data() -> bool:
+    """用沪深300指数当探针，判断今天是否已有行情数据。
+
+    为什么需要：非交易日（周末/长假）与"17:30 前数据未发布"这两种情况，
+    如果直接对 5000+ 只票逐一下查询，要白跑十几分钟才得出结论。
+    先用一只指数探一下，没有就立刻退出。
+    """
+    import baostock as bs
+
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"login失败:{lg.error_msg}")
+
+    today = date.today().strftime("%Y-%m-%d")
+    try:
+        rs = bs.query_history_k_data_plus(
+            "sh.000001", "date,close",
+            start_date=today, end_date=today, frequency="d", adjustflag="3",
+        )
+        if rs.error_code != "0":
+            return False
+        while rs.next():
+            if rs.get_row_data()[0] == today:
+                return True
+        return False
+    finally:
+        try:
+            bs.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--start", default=None, help="覆盖 START_DATE")
+    ap.add_argument("--today-only", action="store_true",
+                    help="仅增量补当天；先用指数探针确认今天有数据，无则立即退出")
     args = ap.parse_args()
 
     global START_DATE
     if args.start:
         START_DATE = args.start
 
+    # GitHub Actions 检出的是干净仓库，logs/ 不在版本控制里，必须自己建，
+    # 否则写 failures.log 时 FileNotFoundError，首次回填直接崩。
+    (ROOT / "logs").mkdir(parents=True, exist_ok=True)
+
     t0 = datetime.now()
+
+    if args.today_only:
+        try:
+            if not today_has_data():
+                print(f"[{t0:%H:%M:%S}] 今日无新数据（休市或尚未发布），跳过", flush=True)
+                return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{t0:%H:%M:%S}] 日期探针失败：{exc}", flush=True)
+            return 1
     print(f"[{t0:%H:%M:%S}] 获取全市场股票列表……", flush=True)
     symbols = get_all_symbols()
     print(f"[{datetime.now():%H:%M:%S}] 共 {len(symbols)} 只股票", flush=True)

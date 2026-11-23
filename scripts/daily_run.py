@@ -23,7 +23,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -145,14 +145,22 @@ def main() -> int:
     settings = get_settings()
     engine = DataEngine(settings)
 
-    # ① 库为空 → 全量回填（Actions 缓存失效、或首次部署）
+    # ① 库为空 → 首次回填（Actions 缓存失效、或首次部署）
     rows = db_row_count(settings.db_path)
     if rows == 0:
-        log.info("本地数据库为空，先执行全量回填……")
+        # 只回填滚动窗口真正需要的历史。
+        # 默认 START_DATE=2024-01-01 会拉 690 多个交易日的量，紧接着又被裁到
+        # KEEP_DAYS，等于白跑四成的请求。按自然日折算（400 交易日 ≈ 560 自然日）
+        # 再留节假日余量，直接按需拉取。
+        warm_start = (now() - timedelta(days=int(KEEP_DAYS * 1.45) + 40)).strftime("%Y-%m-%d")
+        log.info(f"本地数据库为空，先执行首次回填（起始 {warm_start}，保留 {KEEP_DAYS} 交易日）……")
         fast = ROOT / "scripts" / "backfill_parallel.py"
         if fast.exists():
-            # 并行版：每进程只登录一次，比原版快一个数量级
-            rc = subprocess.call([sys.executable, "-u", str(fast), "--workers", "3"], cwd=str(ROOT))
+            # 并行版：每进程只登录一次，3 并发（实测 8 并发会触发 baostock 黑名单）
+            rc = subprocess.call(
+                [sys.executable, "-u", str(fast), "--workers", "3", "--start", warm_start],
+                cwd=str(ROOT),
+            )
         else:
             rc = subprocess.call([sys.executable, "-u", "main.py", "--backfill"], cwd=str(ROOT))
         if rc != 0 or db_row_count(settings.db_path) == 0:
@@ -163,31 +171,26 @@ def main() -> int:
         if trim_history(settings.db_path, KEEP_DAYS):
             log.info(f"回填后裁剪到最近 {KEEP_DAYS} 个交易日")
 
-    # ② 预同步：先确认今天到底是不是交易日
-    # 先探一次登录：若本机 IP 已被 baostock 拉黑，直接退出，
-    # 避免 sync_today_bulk 里 8 个进程同时登录、把封禁坐实。
-    import baostock as _bs
-
-    _probe = _bs.login()
-    if _probe.error_code != "0":
-        _msg = _probe.error_msg or ""
-        if "黑名单" in _msg or _probe.error_code == "10001011":
-            log.error(f"本机 IP 已被 baostock 列入黑名单（{_msg}），本次跳过。"
-                      f"已入库数据不受影响；建议把回填/日常运行交给 GitHub Actions。")
+    # ② 增量同步：只补当天
+    # 用并行脚本而不是 engine.sync_today_bulk()：
+    #   * sync_today_bulk 会起 8 个进程、每个进程各自 login → 触发 baostock 黑名单
+    #   * 并行脚本先拿指数探针确认今天有数据，休市直接返回，不白跑 5000 次查询
+    log.info("增量同步当日数据……")
+    fast = ROOT / "scripts" / "backfill_parallel.py"
+    if fast.exists():
+        rc = subprocess.call(
+            [sys.executable, "-u", str(fast), "--workers", "3", "--today-only"],
+            cwd=str(ROOT),
+        )
+        if rc != 0:
+            log.error(f"增量同步失败（退出码 {rc}），等待下一次调度重试")
             return 1
-        log.warning(f"baostock 登录异常：{_probe.error_code} {_msg}")
     else:
         try:
-            _bs.logout()
-        except Exception:  # noqa: BLE001
-            pass
-
-    log.info("预同步当日数据……")
-    try:
-        engine.sync_today_bulk()
-    except Exception as exc:  # noqa: BLE001
-        log.error(f"预同步失败：{exc}")
-        return 1
+            engine.sync_today_bulk()
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"预同步失败：{exc}")
+            return 1
 
     if not has_date(settings.db_path, today):
         if now().hour >= HOLIDAY_CUTOFF_HOUR:
@@ -206,7 +209,7 @@ def main() -> int:
 
     # ③ 正式跑：策略 + 推送
     log.info("开始执行 main.py（策略计算 + 飞书推送）……")
-    rc = subprocess.call([sys.executable, "-u", "main.py"], cwd=str(ROOT))
+    rc = subprocess.call([sys.executable, "-u", "main.py", "--skip-sync"], cwd=str(ROOT))
     if rc != 0:
         log.error(f"main.py 退出码 {rc}，本次视为失败，等待下一次调度补跑")
         return rc if rc > 0 else 1
