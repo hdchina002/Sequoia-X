@@ -37,20 +37,48 @@ class FeishuNotifier:
             return f"BJ{code}"
         return f"SZ{code}"
 
-    @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
-        return mapping
+    # 全市场「代码→名称」映射，进程内只拉一次；7 个策略共用，避免重复请求。
+    _NAME_CACHE: dict[str, str] = {}
+    _NAME_TRIED = False
+
+    @classmethod
+    def _get_stock_names(cls, symbols: list[str]) -> dict[str, str]:
+        """一次性拉全市场名称映射；数据源异常时返回已知部分，绝不抛异常。
+
+        原实现逐只票调用 query_stock_basic —— 选中 16 只就发 16 次请求。
+        baostock 在 GitHub Actions（Azure 出境）长连接不稳，常返回空包，
+        触发 IndexError 把整个 main.py 带崩。实测 2026-11-23 因此一条消息都没发出去。
+        名称只是卡片的锦上添花，拿不到就显示 SH600000 / SZ000001，不影响推送。
+        """
+        if cls._NAME_TRIED:
+            return cls._NAME_CACHE
+        cls._NAME_TRIED = True
+        try:
+            import socket
+
+            import baostock as bs
+
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(8)
+            try:
+                lg = bs.login()
+                if lg.error_code != "0":
+                    logger.warning(f"股票名称查询登录失败：{lg.error_msg}")
+                    return cls._NAME_CACHE
+                rs = bs.query_stock_basic()  # 不带 code = 一次拿全市场
+                while rs.next():
+                    row = rs.get_row_data()
+                    if len(row) >= 2 and "." in row[0]:
+                        cls._NAME_CACHE[row[0].split(".")[-1]] = row[1]
+                bs.logout()
+                logger.info(f"股票名称映射加载 {len(cls._NAME_CACHE)} 条")
+            finally:
+                socket.setdefaulttimeout(old_timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"股票名称获取失败，卡片将显示代码：{type(exc).__name__}: {exc}"
+            )
+        return cls._NAME_CACHE
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
@@ -115,7 +143,20 @@ class FeishuNotifier:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
-        payload = self._build_card(symbols, strategy_name)
+        try:
+            payload = self._build_card(symbols, strategy_name)
+        except Exception as exc:  # noqa: BLE001
+            # 卡片构建失败也要把结果发出去：降级为纯文本，保证不因显示层问题漏推。
+            logger.error(f"卡片构建失败，降级为纯文本：{type(exc).__name__}: {exc}")
+            payload = {
+                "msg_type": "text",
+                "content": {
+                    "text": (
+                        f"Sequoia-X 选股播报 | {strategy_name}\n"
+                        f"共 {len(symbols)} 只：{' '.join(symbols)}"
+                    )
+                },
+            }
 
         try:
             resp = requests.post(
@@ -138,6 +179,7 @@ class FeishuNotifier:
                 logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
                 return True
 
-        except requests.RequestException as exc:
-            logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+        except Exception as exc:  # noqa: BLE001
+            # 不只拦 requests 异常：飞书返回异常 JSON、编码问题等也不能让主流程崩。
+            logger.error(f"飞书推送异常 [{webhook_key}]：{type(exc).__name__}: {exc}")
             return False

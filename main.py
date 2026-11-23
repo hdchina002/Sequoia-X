@@ -92,15 +92,28 @@ def main() -> None:
             strategy_name = type(strategy).__name__
             logger.info(f"执行策略：{strategy_name}")
 
-            selected: list[str] = strategy.run()
+            # 单个策略崩了不能拖垮其余 6 个，也不能让推送整体中断。
+            try:
+                selected: list[str] = strategy.run()
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"{strategy_name} 执行异常，跳过该策略：{type(exc).__name__}: {exc}"
+                )
+                continue
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
             if selected:
-                ok = notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
-                )
+                try:
+                    ok = notifier.send(
+                        symbols=selected,
+                        strategy_name=strategy_name,
+                        webhook_key=strategy.webhook_key,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        f"{strategy_name} 推送异常：{type(exc).__name__}: {exc}"
+                    )
+                    ok = False
                 if not ok:
                     push_failed += 1
             else:
