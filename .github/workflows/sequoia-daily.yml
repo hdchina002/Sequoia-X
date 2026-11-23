@@ -42,9 +42,11 @@ permissions:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    # 首次回填 5224 只 × 3 并发约 60~90 分钟，再留出重试余量。
-    # 上限定太低会让首次部署在半路被砍，第二天又要从头再拉一遍。
-    timeout-minutes: 240
+    # 首次回填实测 119.6 分钟（5224 只 × 3 并发）。
+    # job 上限给到 330，同时下面给"执行选股"单独设 200 分钟 step 级超时——
+    # 关键：step 超时只会终止那一步，job 还活着，后面带 always() 的保存步骤仍会执行。
+    # 如果只靠 job 级超时，一旦回填卡到边界，整个 job 被杀，两小时数据一起丢（踩过）。
+    timeout-minutes: 330
     env:
       # Runner 默认 UTC。统一成北京时间，否则 date.today() 在跨零点时会算错一天。
       TZ: Asia/Shanghai
@@ -117,6 +119,7 @@ jobs:
       - name: 执行每日选股
         id: run
         if: inputs.publish_baseline != true
+        timeout-minutes: 200
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           # 只保留最近多少个交易日（滚动窗口，体积恒定约 260MB）
