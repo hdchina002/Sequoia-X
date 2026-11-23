@@ -44,6 +44,10 @@ STATE_PATH = ROOT / "data" / "last_success.json"
 FORCE = "--force" in sys.argv
 # 该时点之后仍拿不到当日数据，就认为是休市（baostock 官方口径：交易日 17:30 左右更新）
 HOLIDAY_CUTOFF_HOUR = 18
+# 数据源抽风时的容忍度：库内最新交易日距今天超过这个天数，才判定为"真休市/数据过期"不推送。
+# 5 天覆盖周末（周一跑时最新是上周五 = 3 天）与 3~4 天的小长假。
+# 在此之内，即使今天这一根 K 线没拉到，也照常用最近交易日数据算选股并推送。
+MAX_DATA_LAG_DAYS = int(os.environ.get("MAX_DATA_LAG_DAYS", "5"))
 # 只保留最近 N 个交易日。滚动窗口让库体积恒定，不会随年份膨胀。
 # 400 日 ≈ 1.6 年；最吃历史的 RPS 策略需要 250 日，留足余量。
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "400"))
@@ -129,6 +133,24 @@ def has_date(db_path: str, day: str) -> bool:
     return row is not None
 
 
+def db_latest_date(db_path: str) -> str:
+    """库内最新交易日。数据源抽风时用它判断数据是否还够新。"""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            return conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()[0] or ""
+    except sqlite3.Error:
+        return ""
+
+
+def days_behind(latest: str, today: str) -> int:
+    """最新数据距今天多少自然日。"""
+    if not latest:
+        return 9999
+    from datetime import date
+
+    return (date.fromisoformat(today) - date.fromisoformat(latest)).days
+
+
 def main() -> int:
     today = today_str()
     stamp = now().strftime("%Y-%m-%d %H:%M:%S")
@@ -183,10 +205,10 @@ def main() -> int:
         if trim_history(settings.db_path, KEEP_DAYS):
             log.info(f"回填后裁剪到最近 {KEEP_DAYS} 个交易日")
 
-    # ② 增量同步：只补当天
-    # 用并行脚本而不是 engine.sync_today_bulk()：
-    #   * sync_today_bulk 会起 8 个进程、每个进程各自 login → 触发 baostock 黑名单
-    #   * 并行脚本先拿指数探针确认今天有数据，休市直接返回，不白跑 5000 次查询
+    # ② 增量同步：只补当天 —— best-effort，绝不阻断后续策略。
+    # 踩过的坑：baostock 在 Azure 上偶发 "网络接收错误"，探针 login 失败后旧代码
+    # 直接 return 1，连策略都不跑，结果库里有 251MB 数据却一条消息都没推出去。
+    # 拿不到今天这一根 K 线 ≠ 不能用库里最近一个交易日的数据算选股。
     log.info("增量同步当日数据……")
     fast = ROOT / "scripts" / "backfill_parallel.py"
     if fast.exists():
@@ -195,29 +217,40 @@ def main() -> int:
             cwd=str(ROOT),
         )
         if rc != 0:
-            log.error(f"增量同步失败（退出码 {rc}），等待下一次调度重试")
-            return 1
+            log.warning(
+                f"增量同步失败（退出码 {rc}），改用库内最近交易日数据继续跑策略，不阻断推送"
+            )
     else:
         try:
             engine.sync_today_bulk()
         except Exception as exc:  # noqa: BLE001
-            log.error(f"预同步失败：{exc}")
-            return 1
+            log.warning(f"预同步异常：{exc}，改用库内已有数据继续")
+
+    latest = db_latest_date(settings.db_path)
+    lag = days_behind(latest, today)
+    log.info(f"库内最新交易日 {latest or '无'}，距今天 {lag} 个自然日")
+
+    # 只有"真休市 / 长假 / 数据严重过期"才跳过，不能用"库里没有今天的数据"来判定
+    # —— 后者也可能是数据源临时故障，直接跳过会漏推一整天。
+    if lag > MAX_DATA_LAG_DAYS:
+        log.info(
+            f"数据滞后 {lag} 天（>{MAX_DATA_LAG_DAYS}），判定为休市或数据过期，本次不推送"
+        )
+        write_state(
+            {
+                "last_success_date": today,
+                "finished_at": stamp,
+                "status": "non_trading_day",
+            }
+        )
+        gh_output("updated", "true")
+        return 0
 
     if not has_date(settings.db_path, today):
-        if now().hour >= HOLIDAY_CUTOFF_HOUR:
-            log.info(f"{HOLIDAY_CUTOFF_HOUR}:00 后仍无 {today} 数据，判定为休市，标记完成")
-            write_state(
-                {
-                    "last_success_date": today,
-                    "finished_at": stamp,
-                    "status": "non_trading_day",
-                }
-            )
-            gh_output("updated", "true")
-        else:
-            log.info(f"{today} 暂无数据（可能尚未发布），等待下一次调度")
-        return 0
+        log.warning(
+            f"今日 {today} 数据未到位，仍基于最近交易日 {latest} 推送选股结果"
+            f"（滞后 {lag} 天，数据源恢复后会自动补齐）"
+        )
 
     # ③ 正式跑：策略 + 推送
     log.info("开始执行 main.py（策略计算 + 飞书推送）……")
