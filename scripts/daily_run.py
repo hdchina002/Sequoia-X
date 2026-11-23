@@ -44,8 +44,51 @@ STATE_PATH = ROOT / "data" / "last_success.json"
 FORCE = "--force" in sys.argv
 # 该时点之后仍拿不到当日数据，就认为是休市（baostock 官方口径：交易日 17:30 左右更新）
 HOLIDAY_CUTOFF_HOUR = 18
+# 只保留最近 N 个交易日。滚动窗口让库体积恒定，不会随年份膨胀。
+# 400 日 ≈ 1.6 年；最吃历史的 RPS 策略需要 250 日，留足余量。
+KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "400"))
 
 log = get_logger("daily_run")
+
+
+def gh_output(key: str, value: str) -> None:
+    """把结果写给 GitHub Actions，供后续步骤判断"要不要保存缓存"。"""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{key}={value}\n")
+
+
+def trim_history(db_path: str, keep: int) -> int:
+    """滚动裁剪：只保留最近 keep 个交易日，返回删除行数。
+
+    为什么要裁：Actions 缓存按整包替换，库越大每月占用的缓存越多。
+    固定窗口能让体积恒定（约 260MB），永远贴着 10GB 免费额度以下。
+    """
+    with sqlite3.connect(db_path) as conn:
+        dates = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT ?",
+                (keep,),
+            ).fetchall()
+        ]
+        if len(dates) < keep:
+            return 0
+        cutoff = dates[-1]
+        cur = conn.execute("DELETE FROM stock_daily WHERE date < ?", (cutoff,))
+        conn.commit()
+        dropped = cur.rowcount
+
+    # 删除只把页面标记为空闲，文件本身不会变小。
+    # 大比例裁剪（例如首次把两年历史缩到窗口内）后必须 VACUUM 压实，
+    # 否则缓存里躺着的仍是没裁剪前的大文件。
+    if dropped > 20000:
+        with sqlite3.connect(db_path) as c2:
+            c2.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c2.execute("VACUUM")
+    return dropped
 
 
 def now() -> datetime:
@@ -116,6 +159,9 @@ def main() -> int:
             log.error(f"回填失败（退出码 {rc}），等待下一次调度重试")
             return 1
         log.info(f"回填完成，共 {db_row_count(settings.db_path)} 条")
+        # 回填默认从 START_DATE 起，先裁到滚动窗口，避免第一次就缓存一个超大库
+        if trim_history(settings.db_path, KEEP_DAYS):
+            log.info(f"回填后裁剪到最近 {KEEP_DAYS} 个交易日")
 
     # ② 预同步：先确认今天到底是不是交易日
     # 先探一次登录：若本机 IP 已被 baostock 拉黑，直接退出，
@@ -153,6 +199,7 @@ def main() -> int:
                     "status": "non_trading_day",
                 }
             )
+            gh_output("updated", "true")
         else:
             log.info(f"{today} 暂无数据（可能尚未发布），等待下一次调度")
         return 0
@@ -164,6 +211,11 @@ def main() -> int:
         log.error(f"main.py 退出码 {rc}，本次视为失败，等待下一次调度补跑")
         return rc if rc > 0 else 1
 
+    # ④ 滚动裁剪：只留最近 KEEP_DAYS 个交易日，让库体积恒定
+    dropped = trim_history(settings.db_path, KEEP_DAYS)
+    if dropped:
+        log.info(f"滚动裁剪：删除 {dropped} 条早于最近 {KEEP_DAYS} 个交易日的数据")
+
     write_state(
         {
             "last_success_date": today,
@@ -171,6 +223,8 @@ def main() -> int:
             "status": "ok",
         }
     )
+    # 通知 workflow：数据有变化，才需要保存缓存。空跑的 cron 不保存，省额度。
+    gh_output("updated", "true")
     log.info("今日任务完成")
     return 0
 

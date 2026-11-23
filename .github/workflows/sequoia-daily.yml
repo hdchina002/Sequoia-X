@@ -54,9 +54,10 @@ jobs:
 
       # Runner 是临时容器，跑完即销毁。SQLite 必须靠缓存跨天存活。
       # 缓存整个 data/ 目录：既包含行情库，也包含"今日已完成"的状态文件。
-      # key 带 run_id 保证每次都能写入新缓存；restore-keys 前缀匹配即取最近一份。
+      # 拆成 restore / save 两步是关键：只有真正更新了数据的那一次才 save。
+      # 一天 8 次 cron，如果每次都存 260MB，一周就把 10GB 免费额度撑爆。
       - name: 恢复行情数据库
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: data/
           key: seq-db-${{ github.run_id }}
@@ -83,8 +84,11 @@ jobs:
           PY
 
       - name: 执行每日选股
+        id: run
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # 只保留最近多少个交易日（滚动窗口，体积恒定约 260MB）
+          KEEP_DAYS: '400'
           # 想给每个策略配独立机器人群时，在仓库 Secrets 里加对应变量并取消下面注释
           # STRATEGY_WEBHOOK_TURTLE: ${{ secrets.STRATEGY_WEBHOOK_TURTLE }}
           # STRATEGY_WEBHOOK_MA_VOLUME: ${{ secrets.STRATEGY_WEBHOOK_MA_VOLUME }}
@@ -99,3 +103,12 @@ jobs:
           else
             python scripts/daily_run.py
           fi
+
+      # 只有数据真的变了才写入缓存。当天已推送成功的后续 cron 会跳过这里，
+      # 于是每天只产生 1 份新缓存（约 260MB），月均约 5.7GB，稳在 10GB 免费额度内。
+      - name: 保存行情数据库
+        if: steps.run.outputs.updated == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/
+          key: seq-db-${{ github.run_id }}
