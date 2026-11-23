@@ -111,8 +111,11 @@ jobs:
 
       # 只有数据真的变了才写入缓存。当天已推送成功的后续 cron 会跳过这里，
       # 于是每天只产生 1 份新缓存（约 260MB），月均约 5.7GB，稳在 10GB 免费额度内。
+      # always() 是必须的：数据一旦入库就绝不能因为后续步骤失败而丢弃。
+      # 踩过的坑：首次回填 196 万行、跑满两小时，因 403 只票失败导致整步退出非 0，
+      # 这个 save 被默认跳过，成果连同缓存一起没了，只能从头再来。
       - name: 保存行情数据库
-        if: steps.run.outputs.updated == 'true'
+        if: always() && steps.run.outputs.updated == 'true'
         uses: actions/cache/save@v4
         with:
           path: data/

@@ -163,10 +163,22 @@ def main() -> int:
             )
         else:
             rc = subprocess.call([sys.executable, "-u", "main.py", "--backfill"], cwd=str(ROOT))
-        if rc != 0 or db_row_count(settings.db_path) == 0:
-            log.error(f"回填失败（退出码 {rc}），等待下一次调度重试")
+        rows_after = db_row_count(settings.db_path)
+        if rows_after == 0:
+            log.error(f"回填失败（退出码 {rc}），库仍为空，等待下一次调度重试")
             return 1
-        log.info(f"回填完成，共 {db_row_count(settings.db_path)} 条")
+        if rc != 0:
+            # 部分票失败不该否定整轮：库里已有数据的票就是有效成果，
+            # 缺的票下次 build_tasks 会重新生成任务（库里没有它们的记录）。
+            log.warning(
+                f"回填部分失败（退出码 {rc}），已入库 {rows_after} 条；"
+                f"缺失的股票会在今日增量与下次运行中自动补齐"
+            )
+        # 关键：只要库里有了数据就立刻通知上层保存缓存。
+        # 否则后续增量/策略/推送任一步失败，都会把回填成果一起丢掉
+        # ——云端实测过一次：196 万行、两小时，因为 403 只票失败而全部作废。
+        gh_output("updated", "true")
+        log.info(f"回填完成，共 {rows_after} 条")
         # 回填默认从 START_DATE 起，先裁到滚动窗口，避免第一次就缓存一个超大库
         if trim_history(settings.db_path, KEEP_DAYS):
             log.info(f"回填后裁剪到最近 {KEEP_DAYS} 个交易日")
