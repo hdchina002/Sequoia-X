@@ -20,6 +20,10 @@ class PrivatePlacementStrategy(BaseStrategy):
         webhook_key: 路由到 'private_placement' 飞书机器人。
     """
 
+    display_name: str = "定增公告监控"
+    criteria: str = (
+        "近7天内发布定向增发公告的股票（排除公开增发），属事件提醒而非买卖信号"
+    )
     webhook_key: str = "private_placement"
     _LOOKBACK_DAYS: int = 7  # 回看天数，覆盖一周内的新公告
 

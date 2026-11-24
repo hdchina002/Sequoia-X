@@ -20,6 +20,11 @@ class TurtleTradeStrategy(BaseStrategy):
         webhook_key: 路由到 'turtle' 专属飞书机器人。
     """
 
+    display_name: str = "海龟突破"
+    criteria: str = (
+        "收盘价突破前20个交易日的最高价，当日成交额超1亿元，"
+        "且必须是真阳线（收＞开、收＞昨收，防高开低走诱多）"
+    )
     webhook_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
@@ -68,12 +73,12 @@ class TurtleTradeStrategy(BaseStrategy):
         """
         遍历全市场，返回满足海龟突破条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_local_symbols(self.market)
         candidates: list[str] = []
 
         for symbol in symbols:
             try:
-                df = self.engine.get_ohlcv(symbol)
+                df = self.engine.get_ohlcv(symbol, self.market)
                 if len(df) < self._MIN_BARS:
                     continue
 
@@ -106,7 +111,8 @@ class TurtleTradeStrategy(BaseStrategy):
         # 注意：市值查询只影响排序，不是筛选条件。Azure→baostock 连接不稳时
         # 原实现会抛 IndexError 让整个策略归零（实测 2026-11-23 触发）。
         # 失败就保留原始顺序返回候选，绝不因为"排不了序"丢掉选股结果。
-        if candidates:
+        # 港股通直接跳过：baostock 没有港股，查了也是白查。
+        if candidates and self.market != "hk":
             try:
                 market_caps = self._get_market_caps(candidates)
                 candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)

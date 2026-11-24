@@ -20,6 +20,11 @@ class UptrendLimitDownStrategy(BaseStrategy):
         webhook_key: 路由到 'limit_down' 专属飞书机器人。
     """
 
+    display_name: str = "趋势中跌停错杀"
+    criteria: str = (
+        "昨日20日均线＞60日均线的上升趋势中，今日放量跌停"
+        "（跌幅≥9.5%、成交量＞20日均量2倍），捕捉错杀机会"
+    )
     webhook_key: str = "limit_down"
     _MIN_BARS: int = 60  # 至少需要 60 根 K 线（60日均线）
 

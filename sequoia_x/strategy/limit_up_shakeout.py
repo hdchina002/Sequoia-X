@@ -21,6 +21,11 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         webhook_key: 路由到 'shakeout' 专属飞书机器人。
     """
 
+    display_name: str = "涨停后洗盘"
+    criteria: str = (
+        "昨日涨停（涨幅≥9.5%），今日放量收阴（成交量＞昨日2倍）"
+        "但低点不破昨收（洗盘不破位）"
+    )
     webhook_key: str = "shakeout"
     _MIN_BARS: int = 3  # 至少需要 3 根 K 线（前日、昨日、今日）
 

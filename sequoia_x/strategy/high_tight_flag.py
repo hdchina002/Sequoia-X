@@ -20,6 +20,11 @@ class HighTightFlagStrategy(BaseStrategy):
         webhook_key: 路由到 'flag' 专属飞书机器人。
     """
 
+    display_name: str = "高位旗形整理"
+    criteria: str = (
+        "前40天涨幅超60%的强势股：近10天振幅＜15%、低点不破40天高点的80%、"
+        "成交量缩至20日均量的6成以下（强势横盘等突破）"
+    )
     webhook_key: str = "flag"
     _MIN_BARS: int = 40  # 至少需要 40 根 K 线
 
@@ -30,12 +35,12 @@ class HighTightFlagStrategy(BaseStrategy):
         Returns:
             满足条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_local_symbols(self.market)
         selected: list[str] = []
 
         for symbol in symbols:
             try:
-                df = self.engine.get_ohlcv(symbol)
+                df = self.engine.get_ohlcv(symbol, self.market)
                 if len(df) < self._MIN_BARS:
                     continue
 

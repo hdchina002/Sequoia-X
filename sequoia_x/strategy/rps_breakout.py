@@ -9,14 +9,21 @@ logger = get_logger(__name__)
 class RpsBreakoutStrategy(BaseStrategy):
     """RPS 极强动量突破策略"""
 
+    display_name: str = "RPS强势突破"
+    criteria: str = (
+        "120日涨幅排名全市场前10%（RPS≥90），且收盘价站在120日最高价的90%以上"
+    )
     webhook_key: str = "rps"
     rps_period: int = 120
     rps_threshold: int = 90
 
     def run(self) -> list[str]:
+        table = "hk_daily" if self.market == "hk" else "stock_daily"
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
+                df = pd.read_sql(
+                    f"SELECT symbol, date, close, high FROM {table}", conn
+                )
         except Exception as exc:
             logger.error(f"读取数据库失败: {exc}")
             return []

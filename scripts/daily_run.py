@@ -226,6 +226,19 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             log.warning(f"预同步异常：{exc}，改用库内已有数据继续")
 
+    # ②' 港股通同步：新浪名单 + 腾讯日K（独立数据源，与 baostock 无关）。
+    # 失败只影响港股通卡片，绝不阻断 A 股主流程。
+    hk_sync = ROOT / "scripts" / "hk_sync.py"
+    if hk_sync.exists():
+        hk_rc = subprocess.call(
+            [sys.executable, "-u", str(hk_sync), "--today-only"],
+            cwd=str(ROOT),
+        )
+        if hk_rc != 0:
+            log.warning(f"港股通同步失败（退出码 {hk_rc}），A 股主流程继续")
+    else:
+        log.info("未找到 scripts/hk_sync.py，跳过港股通同步")
+
     latest = db_latest_date(settings.db_path)
     lag = days_behind(latest, today)
     log.info(f"库内最新交易日 {latest or '无'}，距今天 {lag} 个自然日")

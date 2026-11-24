@@ -19,6 +19,10 @@ class MaVolumeStrategy(BaseStrategy):
         webhook_key: 路由到 'ma_volume' 专属飞书机器人。
     """
 
+    display_name: str = "均线放量金叉"
+    criteria: str = (
+        "5日均线上穿20日均线（金叉），且当日成交量放大到20日均量的1.5倍以上"
+    )
     webhook_key: str = "ma_volume"
 
     def run(self) -> list[str]:
@@ -28,12 +32,12 @@ class MaVolumeStrategy(BaseStrategy):
         Returns:
             满足条件的股票代码列表。
         """
-        symbols = self.engine.get_local_symbols()
+        symbols = self.engine.get_local_symbols(self.market)
         selected: list[str] = []
 
         for symbol in symbols:
             try:
-                df = self.engine.get_ohlcv(symbol)
+                df = self.engine.get_ohlcv(symbol, self.market)
                 if len(df) < 20:
                     continue
 

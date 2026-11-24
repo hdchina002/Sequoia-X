@@ -30,12 +30,52 @@ class FeishuNotifier:
 
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
-        """将纯数字代码转为雪球格式：6开头→SH，4/8开头→BJ，其余→SZ。"""
+        """将纯数字代码转为雪球格式：5位→HK，6开头→SH，4/8/9开头→BJ，其余→SZ。"""
+        if len(code) == 5:
+            return f"HK{code}"
         if code.startswith("6"):
             return f"SH{code}"
-        elif code.startswith(("4", "8")):
+        if code.startswith(("4", "8", "9")):
             return f"BJ{code}"
         return f"SZ{code}"
+
+    @staticmethod
+    def _market_label(code: str) -> str:
+        """代码→市场中文前缀，名称拿不到时降级显示成「深 002749」而不是 SZ002749。"""
+        if len(code) == 5:
+            return "港"
+        if code.startswith("6"):
+            return "沪"
+        if code.startswith(("4", "8", "9")):
+            return "京"
+        return "深"
+
+    @classmethod
+    def _fetch_names_from_tencent(cls, codes: list[str]) -> dict[str, str]:
+        """用腾讯行情快照批量补股票名称（baostock 拿不到时的兜底）。
+
+        返回 {6位代码: 中文名}。每批最多 50 只（腾讯 URL 过长会 414），
+        单批失败只影响该批，绝不抛异常。
+        """
+        result: dict[str, str] = {}
+        if not codes:
+            return result
+        for i in range(0, len(codes), 50):
+            batch = codes[i : i + 50]
+            query = ",".join(cls._to_xueqiu_code(c).lower() for c in batch)
+            try:
+                resp = requests.get(f"https://qt.gtimg.cn/q={query}", timeout=8)
+                text = resp.content.decode("gbk", errors="ignore")
+                for line in text.splitlines():
+                    if '="' not in line:
+                        continue
+                    payload = line.split("=", 1)[1].strip().strip('";')
+                    fields = payload.split("~")
+                    if len(fields) >= 3 and fields[1] and fields[2]:
+                        result[fields[2]] = fields[1]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"腾讯名称补全批次失败：{type(exc).__name__}: {exc}")
+        return result
 
     # 全市场「代码→名称」映射，进程内只拉一次；7 个策略共用，避免重复请求。
     _NAME_CACHE: dict[str, str] = {}
@@ -43,54 +83,76 @@ class FeishuNotifier:
 
     @classmethod
     def _get_stock_names(cls, symbols: list[str]) -> dict[str, str]:
-        """一次性拉全市场名称映射；数据源异常时返回已知部分，绝不抛异常。
+        """取「代码→名称」映射；数据源异常时返回已知部分，绝不抛异常。
 
         原实现逐只票调用 query_stock_basic —— 选中 16 只就发 16 次请求。
         baostock 在 GitHub Actions（Azure 出境）长连接不稳，常返回空包，
         触发 IndexError 把整个 main.py 带崩。实测 2026-11-23 因此一条消息都没发出去。
-        名称只是卡片的锦上添花，拿不到就显示 SH600000 / SZ000001，不影响推送。
+
+        兜底链：baostock 全市场（进程内缓存一次）→ 腾讯快照只补本次用到的缺票。
+        两层都拿不到就降级显示「深 002749」，不影响推送。
         """
-        if cls._NAME_TRIED:
-            return cls._NAME_CACHE
-        cls._NAME_TRIED = True
-        try:
-            import socket
-
-            import baostock as bs
-
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(8)
+        if not cls._NAME_TRIED:
+            cls._NAME_TRIED = True
             try:
-                lg = bs.login()
-                if lg.error_code != "0":
-                    logger.warning(f"股票名称查询登录失败：{lg.error_msg}")
-                    return cls._NAME_CACHE
-                rs = bs.query_stock_basic()  # 不带 code = 一次拿全市场
-                while rs.next():
-                    row = rs.get_row_data()
-                    if len(row) >= 2 and "." in row[0]:
-                        cls._NAME_CACHE[row[0].split(".")[-1]] = row[1]
-                bs.logout()
-                logger.info(f"股票名称映射加载 {len(cls._NAME_CACHE)} 条")
-            finally:
-                socket.setdefaulttimeout(old_timeout)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"股票名称获取失败，卡片将显示代码：{type(exc).__name__}: {exc}"
-            )
+                import socket
+
+                import baostock as bs
+
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(8)
+                try:
+                    lg = bs.login()
+                    if lg.error_code != "0":
+                        logger.warning(f"股票名称查询登录失败：{lg.error_msg}")
+                    else:
+                        rs = bs.query_stock_basic()  # 不带 code = 一次拿全市场
+                        while rs.next():
+                            row = rs.get_row_data()
+                            if len(row) >= 2 and "." in row[0]:
+                                cls._NAME_CACHE[row[0].split(".")[-1]] = row[1]
+                        bs.logout()
+                        logger.info(f"股票名称映射加载 {len(cls._NAME_CACHE)} 条")
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"股票名称获取失败，改用腾讯接口补：{type(exc).__name__}: {exc}"
+                )
+
+        # 腾讯快照补缺：只补本次推送真正用到、且 baostock 没给到的票
+        missing = [s for s in symbols if s and s not in cls._NAME_CACHE]
+        if missing:
+            filled = cls._fetch_names_from_tencent(missing)
+            cls._NAME_CACHE.update(filled)
+            logger.info(f"腾讯接口补名称 {len(filled)}/{len(missing)} 条")
         return cls._NAME_CACHE
 
-    def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
+    def _build_card(
+        self,
+        symbols: list[str],
+        strategy_name: str,
+        criteria: str = "",
+    ) -> dict:
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
 
         links: list[str] = []
         for code in symbols:
             xq_code = self._to_xueqiu_code(code)
-            name = names.get(code, xq_code)
+            # 名称兜底链：baostock/腾讯名称 → 「深 002749」这种中文市场前缀
+            name = names.get(code) or f"{self._market_label(code)} {code}"
             links.append(f"[{name}](https://xueqiu.com/S/{xq_code})")
 
         symbol_text = " ".join(links) if links else "（无选股结果）"
+
+        info_lines = [
+            f"**日期：** {today}",
+            f"**策略：** {strategy_name}",
+        ]
+        if criteria:
+            info_lines.append(f"**入选标准：** {criteria}")
+        info_lines.append(f"**选股数量：** {len(symbols)}")
 
         return {
             "msg_type": "interactive",
@@ -107,7 +169,7 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
+                            "content": "\n".join(info_lines),
                         },
                     },
                     {"tag": "hr"},
@@ -127,6 +189,7 @@ class FeishuNotifier:
         symbols: list[str],
         strategy_name: str,
         webhook_key: str = "default",
+        criteria: str = "",
     ) -> bool:
         """
         将选股结果格式化为飞书卡片消息并 POST 至对应 Webhook。
@@ -136,15 +199,16 @@ class FeishuNotifier:
 
         Args:
             symbols: 选股结果代码列表。
-            strategy_name: 策略名称，用于卡片标题。
+            strategy_name: 策略中文名，用于卡片标题与正文。
             webhook_key: 策略标识，用于路由到对应飞书机器人。
+            criteria: 入选标准的一句话说明，展示在卡片里。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
         url = self.settings.get_webhook_url(webhook_key)
         try:
-            payload = self._build_card(symbols, strategy_name)
+            payload = self._build_card(symbols, strategy_name, criteria)
         except Exception as exc:  # noqa: BLE001
             # 卡片构建失败也要把结果发出去：降级为纯文本，保证不因显示层问题漏推。
             logger.error(f"卡片构建失败，降级为纯文本：{type(exc).__name__}: {exc}")
@@ -153,6 +217,7 @@ class FeishuNotifier:
                 "content": {
                     "text": (
                         f"Sequoia-X 选股播报 | {strategy_name}\n"
+                        f"入选标准：{criteria}\n"
                         f"共 {len(symbols)} 只：{' '.join(symbols)}"
                     )
                 },

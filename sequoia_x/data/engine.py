@@ -30,6 +30,33 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+# 港股通行情表：结构与 stock_daily 完全一致，但必须分表——
+# 7 个 A 股策略都靠 get_local_symbols() 全表扫描，混表会把港股扫进 A 股策略。
+_CREATE_HK_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS hk_daily (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol   TEXT    NOT NULL,
+    date     TEXT    NOT NULL,
+    open     REAL,
+    high     REAL,
+    low      REAL,
+    close    REAL,
+    volume   REAL,
+    turnover REAL,
+    UNIQUE (symbol, date)
+);
+"""
+
+_CREATE_HK_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_hk_symbol_date ON hk_daily (symbol, date);
+"""
+
+# market → 表名白名单（防止把用户输入拼进 SQL）
+_TABLE_BY_MARKET = {
+    "a": "stock_daily",
+    "hk": "hk_daily",
+}
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
@@ -66,6 +93,8 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_HK_TABLE_SQL)
+            conn.execute(_CREATE_HK_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -77,10 +106,11 @@ class DataEngine:
             ).fetchone()
         return row[0] if row and row[0] else None
 
-    def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+    def get_ohlcv(self, symbol: str, market: str = "a") -> pd.DataFrame:
+        table = _TABLE_BY_MARKET.get(market, "stock_daily")
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql(
-                "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
+                f"SELECT * FROM {table} WHERE symbol = ? ORDER BY date",
                 conn,
                 params=(symbol,),
             )
@@ -330,9 +360,10 @@ class DataEngine:
         finally:
             bs.logout()
 
-    def get_local_symbols(self) -> list[str]:
+    def get_local_symbols(self, market: str = "a") -> list[str]:
+        table = _TABLE_BY_MARKET.get(market, "stock_daily")
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
+                f"SELECT DISTINCT symbol FROM {table}"
             ).fetchall()
         return [row[0] for row in rows]
