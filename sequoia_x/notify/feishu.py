@@ -133,18 +133,19 @@ class FeishuNotifier:
         symbols: list[str],
         strategy_name: str,
         criteria: str = "",
+        force_flat: bool = False,
     ) -> dict:
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
 
         links: list[str] = []
         for code in symbols:
-            xq_code = self._to_xueqiu_code(code)
+            # 港股（5位）雪球网页 URL 用纯数字不带 HK 前缀（HK00700 是 API 格式，网页会报错）；
+            # A股用 SH/SZ/BJ 前缀。
+            url_code = code if len(code) == 5 else self._to_xueqiu_code(code)
             # 名称兜底链：baostock/腾讯名称 → 「深 002749」这种中文市场前缀
             name = names.get(code) or f"{self._market_label(code)} {code}"
-            links.append(f"[{name}](https://xueqiu.com/S/{xq_code})")
-
-        symbol_text = " ".join(links) if links else "（无选股结果）"
+            links.append(f"[{name}](https://xueqiu.com/S/{url_code})")
 
         info_lines = [
             f"**日期：** {today}",
@@ -154,9 +155,50 @@ class FeishuNotifier:
             info_lines.append(f"**入选标准：** {criteria}")
         info_lines.append(f"**选股数量：** {len(symbols)}")
 
+        _MAX_VISIBLE = 20  # 超过 20 只时折叠：前 20 直接可见，其余点「展开」看
+
+        # —— 少于等于 20 只：全量平铺（老格式，兼容性最好）——
+        if force_flat or len(links) <= _MAX_VISIBLE:
+            symbol_text = " ".join(links) if links else "（无选股结果）"
+            return {
+                "msg_type": "interactive",
+                "card": {
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": f"📈 Sequoia-X 选股播报 | {strategy_name}",
+                        },
+                        "template": "blue",
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": "\n".join(info_lines),
+                            },
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**选股列表：**\n{symbol_text}",
+                            },
+                        },
+                    ],
+                },
+            }
+
+        # —— 超过 20 只：前 20 平铺 + collapsible_panel 折叠其余（卡片 2.0）——
+        visible_text = " ".join(links[:_MAX_VISIBLE])
+        hidden_text = " ".join(links[_MAX_VISIBLE:])
+        hidden_count = len(links) - _MAX_VISIBLE
         return {
             "msg_type": "interactive",
             "card": {
+                "schema": "2.0",
+                "config": {"update_multi": True},
                 "header": {
                     "title": {
                         "tag": "plain_text",
@@ -164,23 +206,44 @@ class FeishuNotifier:
                     },
                     "template": "blue",
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": "\n".join(info_lines),
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": "\n".join(info_lines),
+                            },
                         },
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**选股列表：**\n{symbol_text}",
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**选股列表（前 {_MAX_VISIBLE} 只）：**\n{visible_text}",
+                            },
                         },
-                    },
-                ],
+                        {
+                            "tag": "collapsible_panel",
+                            "expanded": False,
+                            "header": {
+                                "title": {
+                                    "tag": "plain_text",
+                                    "content": f"展开剩余 {hidden_count} 只（点击展开）",
+                                },
+                            },
+                            "elements": [
+                                {
+                                    "tag": "div",
+                                    "text": {
+                                        "tag": "lark_md",
+                                        "content": hidden_text,
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                },
             },
         }
 
@@ -232,6 +295,25 @@ class FeishuNotifier:
             )
             # 解析飞书真正的返回体
             resp_json = resp.json()
+
+            # schema 2.0 的 collapsible_panel 若飞书不支持，降级重发（全量平铺）
+            if (
+                resp.status_code != 200 or resp_json.get("code") != 0
+            ) and payload.get("card", {}).get("schema") == "2.0":
+                logger.warning(
+                    f"卡片 2.0 schema 发送失败，降级为平铺列表重发："
+                    f"HTTP={resp.status_code} 响应={resp.text[:200]}"
+                )
+                payload = self._build_card(
+                    symbols, strategy_name, criteria, force_flat=True
+                )
+                resp = requests.post(
+                    url,
+                    data=json.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                    timeout=10,
+                )
+                resp_json = resp.json()
 
             # 飞书真正的成功标志是内部的 code == 0
             if resp.status_code != 200 or resp_json.get("code") != 0:
